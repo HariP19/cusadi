@@ -9,8 +9,10 @@ setup(
     author="Se Hwan Jeon",
     author_email="sehwan@mit.edu",
     url="https://github.com/se-hwan/cusadi",
-    packages=find_packages(),
+    # packages=find_packages(),
     # package_data={'test': ['test.txt']},
+    packages=find_packages(where='src'),
+    package_dir={'': 'src'},
     include_package_data=True,
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -24,5 +26,5 @@ setup(
         'matplotlib',
         'torch'
     ],
-    setup_requires=['setuptools'],
+    # setup_requires=['setuptools'],
 )
