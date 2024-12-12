@@ -19,13 +19,13 @@ dtype = torch.double
 # Set paths and parameters
 DATA_DIR = '/home/docker_dev/casadi_examples/optimization/test_data/mpc_qpbenchmark/data'
 FILENAMES = [f"LIPMWALK{i}.npz" for i in range(3)]  # LIPMWALK0 to LIPMWALK29
-N_PROBLEM = 3  # number of QP problems to solve in parallel
+N_PROBLEM = 100  # number of QP problems to solve in parallel
 MAX_ITER = 10
 TOL = 1e-4
 rho_init = 1.0
 
 # Load the penalty QP CasADi function
-penalty_qp_step = Function.load(os.path.join(CUSADI_FUNCTION_DIR, "fn_penalty_qp_iteration.casadi"))
+penalty_qp_step = Function.load(os.path.join(CUSADI_FUNCTION_DIR, "fn_penalty_qp_step.casadi"))
 fn_cusadi_penalty_qp_step = CusadiFunction(penalty_qp_step, N_PROBLEM)
 
 # Pre-load all QP problems into a list
@@ -40,68 +40,76 @@ for fname in FILENAMES:
     data.close()
     qp_problems.append((P_prob, q_prob, G_prob, h_prob))
 
+print("Random indices: ", random.choices(range(len(qp_problems)), k=N_PROBLEM))
+
 # Randomly select N_PROBLEM QPs (with replacement if needed)
-# selected_problems = [qp_problems[i] for i in random.choices(range(len(qp_problems)), k=N_PROBLEM)]
-selected_problems = [qp_problems[i] for i in range(3)] # TODO: TEMP
+selected_problems = [qp_problems[i] for i in random.choices(range(len(qp_problems)), k=N_PROBLEM)]
+# selected_problems = [qp_problems[i] for i in range(3)] # TODO: TEMP
 
 # Extract dimensions
 n = selected_problems[0][0].shape[0]  # dimension of decision variables from P
 m = selected_problems[0][2].shape[0]  # number of inequality constraints from G
 
-# Initialize all QPs as torch Tensors on the GPU
-x0_all = torch.randn((N_PROBLEM, n), device=device, dtype=dtype)
-lambda0_all = torch.zeros((N_PROBLEM, 1), device=device, dtype=dtype)
-mu0_all = torch.ones((N_PROBLEM, 1), device=device, dtype=dtype)
+def solve_parallel_pqp():
+    # Initialize all QPs as torch Tensors on the GPU
+    x0_all = torch.randn((N_PROBLEM, n), device=device, dtype=dtype)
+    lambda0_all = torch.zeros((N_PROBLEM, 1), device=device, dtype=dtype)
+    mu0_all = torch.ones((N_PROBLEM, 1), device=device, dtype=dtype)
 
-Q_all = torch.stack([torch.tensor(p[0], device=device, dtype=dtype) 
-                     for p in selected_problems], dim=0)
-q_all = torch.stack([torch.tensor(p[1], device=device, dtype=dtype) 
-                     for p in selected_problems], dim=0)
-G_all = torch.stack([torch.tensor(p[2], device=device, dtype=dtype) 
-                     for p in selected_problems], dim=0)
-h_all = torch.stack([torch.tensor(p[3], device=device, dtype=dtype) 
-                     for p in selected_problems], dim=0)
+    Q_all = torch.stack([torch.tensor(p[0], device=device, dtype=dtype) 
+                        for p in selected_problems], dim=0)
+    q_all = torch.stack([torch.tensor(p[1], device=device, dtype=dtype) 
+                        for p in selected_problems], dim=0)
+    G_all = torch.stack([torch.tensor(p[2], device=device, dtype=dtype) 
+                        for p in selected_problems], dim=0)
+    h_all = torch.stack([torch.tensor(p[3], device=device, dtype=dtype) 
+                        for p in selected_problems], dim=0)
 
-A_all = torch.zeros(N_PROBLEM, 0, n, device=device, dtype=dtype)
-b_all = torch.zeros(N_PROBLEM, 0, 1, device=device, dtype=dtype)
-
-
-start_time = time.time()
-for iter in range(MAX_ITER):
-    # No need to convert to torch tensors again if they're already torch tensors
-    fn_cusadi_penalty_qp_step.evaluate([x0_all, lambda0_all, mu0_all, Q_all, q_all, A_all, b_all, G_all, h_all])
-
-    # Retrieve results as torch tensors directly
-    x_next = fn_cusadi_penalty_qp_step.outputs_sparse[0]
-    lambda_next = fn_cusadi_penalty_qp_step.outputs_sparse[1]
-
-    # Check convergence directly in torch
-    dx = torch.norm(x_next - x0_all, dim=1)
-    converged = dx < TOL
-
-    if torch.all(converged):
-        print(f'All QP problems converged in {iter} iterations in {time.time()-start_time:.2e} seconds')
-        break
+    A_all = torch.zeros(N_PROBLEM, 0, n, device=device, dtype=dtype)
+    b_all = torch.zeros((N_PROBLEM, 1), device=device, dtype=dtype)
     
-    # Update parameters for the next iteration
-    x0_all = x_next.clone()
-    lambda0_all = lambda_next.clone() # Commented because no equality constraints
-    mu0_all = mu0_all * 10
+    Q_all_flat = Q_all.transpose(1,2).reshape(N_PROBLEM, -1)
+    A_all_flat = A_all.transpose(1,2).reshape(N_PROBLEM, -1)
+    G_all_flat = G_all.transpose(1,2).reshape(N_PROBLEM, -1)
+        
+    start_time = time.time()
+    for iter in range(MAX_ITER):
+        
+        # Evaluate the penalty QP step function
+        fn_cusadi_penalty_qp_step.evaluate([x0_all, lambda0_all, mu0_all, Q_all_flat, q_all, A_all_flat, b_all, G_all_flat, h_all])
 
-if not torch.all(converged):
-    print(f'Not all QP problems converged within {MAX_ITER} iterations')
-    
-optimal_costs = []
-for i in range(N_PROBLEM):
-    x = x_next[i, :]
-    q = q_all[i, :]
-    P = Q_all[i, :]
-    optimal_costs.append(0.5 * x @ P @ x + q @ x)
-    print(f'Optimal x for QP problem {i}: {x}')
-    print(f'Optimal cost for QP problem {i}: {optimal_costs[i]}')
+        # Retrieve results as torch tensors directly
+        x_next = fn_cusadi_penalty_qp_step.outputs_sparse[0]
+        lambda_next = fn_cusadi_penalty_qp_step.outputs_sparse[1]
+
+        # Check convergence directly in torch
+        dx = torch.norm(x_next - x0_all, dim=1)
+        converged = dx < TOL
+
+        if torch.all(converged):
+            print(f'All QP problems converged in {iter} iterations in {time.time()-start_time:.2e} seconds')
+            break
+        
+        # Update parameters for the next iteration
+        x0_all = x_next.clone()
+        # lambda0_all = lambda_next.clone() # Commented because no equality constraints
+        mu0_all = mu0_all * 10
+
+    if not torch.all(converged):
+        print(f'Not all QP problems converged within {MAX_ITER} iterations')
 
 
-## =================== Compare with cvxpy ===================
+    # print("\n-------------------Parallel PQP -------------------")    
+    optimal_costs = []
+    for i in range(N_PROBLEM):
+        x = x_next[i, :]
+        q = q_all[i, :]
+        P = Q_all[i, :]
+        optimal_costs.append(0.5 * x.T @ P @ x + q @ x)
+        # print(f'Optimal x for QP problem {i}: {x}')
+        print(f'Optimal cost for QP problem {i}: {optimal_costs[i]}\n')
+
+# ## =================== Compare with cvxpy ===================
 def solve_cvxpy(P, q, G, h, solver=cp.OSQP, verbose=False):
     n = P.shape[1]
     m_ineq = G.shape[0]
@@ -119,16 +127,20 @@ def solve_cvxpy(P, q, G, h, solver=cp.OSQP, verbose=False):
     
     return x.value, solve_time, problem.status
 
-# Solve the selected problems using cvxpy
+# Solve the selected problems using parallel QP
+solve_parallel_pqp()
+
+# # Solve the selected problems using cvxpy
 optimal_costs_cvxpy = []
 solve_times = []
+print("\n------------------- CVXPY -------------------")
 for i in range(N_PROBLEM):
     P = selected_problems[i][0]
     q = selected_problems[i][1]
     G = selected_problems[i][2]
     h = selected_problems[i][3]
-    x_cvxpy, solve_time, status = solve_cvxpy(P, q, G, h, verbose=True)
+    x_cvxpy, solve_time, status = solve_cvxpy(P, q, G, h, verbose=False)
     solve_times.append(solve_time)
-    optimal_costs_cvxpy.append(0.5 * x_cvxpy @ P @ x_cvxpy + q @ x_cvxpy)
-    print(f'Optimal x for QP problem {i} using cvxpy: {x_cvxpy}')
-    print(f'Optimal cost for QP problem {i} using cvxpy: {optimal_costs_cvxpy[i]}')
+    optimal_costs_cvxpy.append(0.5 * x_cvxpy.T @ P @ x_cvxpy + q @ x_cvxpy)
+    # print(f'Optimal x for QP problem {i} using cvxpy: {x_cvxpy}')
+    print(f'Optimal cost for QP problem {i} using cvxpy: {optimal_costs_cvxpy[i]}\n')
